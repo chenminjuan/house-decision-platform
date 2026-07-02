@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+1.ipynb
+
+# Test data (not needed for app)
+data/data1.json
+data/test.json
+data/products.json
+data/employees.csv
+data/penguins.csv
+data/sleep.csv
+data/weather.csv
+data/weather_withna.csv
+data/new.csv
+data_exploration.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
