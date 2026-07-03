@@ -465,7 +465,7 @@ try:
 except ImportError:
     # plotly未安装时的降级处理
     def plot_radar_chart(regions_data):
-            fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(10, 5))
         ax.text(0.5, 0.5, '雷达图需要安装plotly库\n请运行: pip install plotly',
                 ha='center', va='center', fontsize=15, transform=ax.transAxes)
         ax.set_title('雷达图（需plotly支持）', color='red', fontsize=20)
@@ -473,7 +473,7 @@ except ImportError:
         return plt.gcf()
 
     def plot_unit_heatmap(df, top_n_cities=10):
-            fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(10, 5))
         ax.text(0.5, 0.5, '热力图需要安装plotly库\n请运行: pip install plotly',
                 ha='center', va='center', fontsize=15, transform=ax.transAxes)
         ax.set_title('热力图（需plotly支持）', color='red', fontsize=20)
