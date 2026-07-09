@@ -156,6 +156,29 @@ cols2[2].metric('覆盖城市', f'{filtered_df["city"].nunique()}个')
 price_std = filtered_df['price_num'].std()
 cols2[3].metric('价格标准差', f'{price_std:.1f}万元')
 
+# 数据完整度指标
+from data_processor import get_city_year_coverage
+year_cov, year_total, year_has = get_city_year_coverage(filtered_df)
+if year_cov >= 0.7:
+    cov_color = 'green'
+elif year_cov >= 0.5:
+    cov_color = 'orange'
+else:
+    cov_color = 'red'
+
+st.markdown('---')
+st.markdown('### 数据质量')
+q_cols = st.columns(4)
+q_cols[0].metric('年份数据完整度', f'{year_cov*100:.0f}%',
+                 delta=f'{year_has}/{year_total}条',
+                 help='建成年份覆盖率。A(>90%)/B(70-90%)/C(50-70%)/D(<50%)，影响房龄评分可靠性')
+quality_level = 'A' if year_cov >= 0.9 else ('B' if year_cov >= 0.7 else ('C' if year_cov >= 0.5 else 'D'))
+q_cols[1].metric('数据质量等级', f'{quality_level}级',
+                 delta='房龄评分可靠' if year_cov >= 0.7 else ('房龄权重自动降低' if year_cov >= 0.5 else '房龄维度已关闭'),
+                 delta_color='normal' if year_cov >= 0.7 else ('off' if year_cov >= 0.5 else 'inverse'))
+q_cols[2].metric('总房源数', f'{len(filtered_df):,}条')
+q_cols[3].metric('数据来源', '房天下二手房', delta='实时更新')
+
 # ========== 图表区域 ==========
 st.markdown('---')
 

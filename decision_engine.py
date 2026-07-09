@@ -73,27 +73,65 @@ def hard_filter(df, preferences):
 
 # ========== Phase 2: 加权评分 ==========
 
-def compute_matching_score(filtered_df, full_df, weights):
+def compute_matching_score(filtered_df, full_df, weights,
+                           monthly_income=None, savings=None,
+                           first_house=True, loan_years=30,
+                           monthly_expense=None):
     """
-    加权评分算法（0-100分）
+    加权评分算法（0-100分），含自适应数据质量降级。
+
     weights: dict with keys:
-        w_price, w_area, w_age, w_unit, w_location
+        w_price, w_area, w_age, w_unit, w_location, w_afford(可选)
         各维度权重(0-100)，会被归一化为总和=1
+
+    自适应逻辑：
+      - 计算当前筛选集的年份覆盖率
+      - 覆盖率 < 70% → 自动降低房龄权重，差额分配至其他维度
+      - 覆盖率 < 50% → 完全移除房龄维度
+
+    新增（Phase 1 MVP）：
+      - S_afford: 购买力适配度（月供/收入比评分），需传入 monthly_income
+
+    Returns:
+        DataFrame: 带评分的房源列表
+        dict: 权重调整信息（供UI展示）
     """
+    from data_processor import get_city_year_coverage, adapt_age_weight
+
     df = filtered_df.copy()
     if len(df) == 0:
-        return df
+        return df, {'adapted': False, 'coverage': 0, 'level': 'N/A'}
 
-    # 归一化权重
-    total_w = sum(weights.values())
-    if total_w == 0:
-        # 默认等权重
-        weights = {k: 20 for k in weights}
-        total_w = 100
-    norm_weights = {k: v / total_w for k, v in weights.items()}
+    # ---- 年份覆盖率检测 ----
+    coverage, total_n, has_year = get_city_year_coverage(df)
+
+    # ---- 自适应权重调整 ----
+    original_weights = dict(weights)
+    adjusted_weights = adapt_age_weight(weights, coverage)
+
+    weight_adapted = (adjusted_weights != original_weights)
+
+    # 确定质量等级
+    if coverage >= 0.9:
+        level = 'A'
+    elif coverage >= 0.7:
+        level = 'B'
+    elif coverage >= 0.5:
+        level = 'C'
+    else:
+        level = 'D'
+
+    weight_info = {
+        'adapted': weight_adapted,
+        'coverage': round(coverage * 100, 1),
+        'level': level,
+        'original_weights': original_weights,
+        'adjusted_weights': dict(adjusted_weights),  # 快照：S_afford 添加前
+        'total_records': total_n,
+        'has_year_records': has_year,
+    }
 
     # ----- 维度1: 价格合理性 -----
-    # 价格越低越好（相对预算范围内）—— 价格在预算下限时得100分
     budget_min = df['price_num'].min()
     budget_max = df['price_num'].max()
     if budget_max > budget_min:
@@ -102,20 +140,17 @@ def compute_matching_score(filtered_df, full_df, weights):
         df['S_price'] = 50
 
     # ----- 维度2: 面积匹配度 -----
-    # 使用高斯距离到理想面积（面积中位数作为理想值）
     ideal_area = df['area_num'].median()
     if ideal_area > 0:
-        sigma = ideal_area * 0.3  # 30%宽度的高斯核
+        sigma = ideal_area * 0.3
         df['S_area'] = 100 * np.exp(-((df['area_num'] - ideal_area) ** 2) / (2 * sigma ** 2))
     else:
         df['S_area'] = 50
 
     # ----- 维度3: 房龄评分 -----
-    # 越新越高分，40年以上为0
     df['S_age'] = 100 * np.maximum(0, 1 - df['age'].fillna(20) / 40)
 
     # ----- 维度4: 单价合理性 -----
-    # 单价越低越好
     unit_max = df['unit_num'].max()
     unit_min = df['unit_num'].min()
     if unit_max > unit_min:
@@ -124,27 +159,71 @@ def compute_matching_score(filtered_df, full_df, weights):
         df['S_unit'] = 50
 
     # ----- 维度5: 地段热度 -----
-    # 城市挂牌密度百分位（流通性代理）
     city_counts = full_df['city'].value_counts()
     total_cities = len(city_counts)
     city_percentile = {}
     for i, (city, count) in enumerate(city_counts.items()):
-        city_percentile[str(city)] = (1 - i / total_cities) * 100  # 排名越靠前分越高
-    # 将city转为字符串后映射（处理category类型）
+        city_percentile[str(city)] = (1 - i / total_cities) * 100
     df['S_location'] = df['city'].astype(str).map(city_percentile).fillna(50).astype(float)
 
-    # ----- 加权总分 -----
+    # ----- 维度6: 购买力适配度（仅当用户提供收入时激活）-----
+    has_afford = monthly_income is not None and monthly_income > 0
+    if has_afford:
+        # 使用可支配收入（月收入-月支出）更精准
+        if monthly_expense is not None and monthly_expense > 0:
+            effective_income = max(1, monthly_income - monthly_expense)
+        else:
+            effective_income = monthly_income
+
+        down_ratio = 0.20 if first_house else 0.30
+        monthly_rate = 3.95 / 100 / 12  # LPR 3.95%
+        total_months = loan_years * 12
+
+        def _calc_income_ratio(price):
+            """计算月供占可支配收入比"""
+            loan = price * (1 - down_ratio) * 10000  # 贷款金额（元）
+            if monthly_rate > 0 and loan > 0:
+                monthly = loan * monthly_rate * (1 + monthly_rate) ** total_months / \
+                          ((1 + monthly_rate) ** total_months - 1)
+            else:
+                monthly = loan / total_months if total_months > 0 else 0
+            return monthly / effective_income if effective_income > 0 else 999
+
+        df['_income_ratio'] = df['price_num'].apply(_calc_income_ratio)
+        # 评分：ratio≤20%→100分，ratio≥50%→0分，线性递减
+        df['S_afford'] = (100 * (0.50 - df['_income_ratio']) / 0.30).clip(0, 100)
+        # 确保 w_afford 在权重字典中存在
+        if 'w_afford' not in adjusted_weights:
+            adjusted_weights['w_afford'] = 60  # 默认权重
+    else:
+        df['S_afford'] = 50  # 无收入数据时给中性分
+        # 无收入数据时不参与加权，权重设为0
+        adjusted_weights['w_afford'] = 0
+
+    # ----- 加权总分（重新归一化，因为可能新增了 w_afford）-----
+    total_w = sum(adjusted_weights.values())
+    if total_w == 0:
+        adjusted_weights = {k: 20 for k in adjusted_weights}
+        total_w = 100
+    norm_weights = {k: v / total_w for k, v in adjusted_weights.items()}
+
+    # 更新 weight_info 中的 adjusted_weights（包含可能新增的 w_afford）
+    weight_info['adjusted_weights'] = dict(adjusted_weights)
+
     df['score'] = (
             norm_weights.get('w_price', 0.2) * df['S_price'] +
             norm_weights.get('w_area', 0.2) * df['S_area'] +
             norm_weights.get('w_age', 0.2) * df['S_age'] +
             norm_weights.get('w_unit', 0.2) * df['S_unit'] +
-            norm_weights.get('w_location', 0.2) * df['S_location']
+            norm_weights.get('w_location', 0.2) * df['S_location'] +
+            norm_weights.get('w_afford', 0) * df['S_afford']
     )
 
-    # 排序
+    # 附加权重信息到 dataframe（供报告使用）
+    df.attrs['weight_info'] = weight_info
+
     df = df.sort_values('score', ascending=False)
-    return df
+    return df, weight_info
 
 
 def get_top_recommendations(scored_df, top_n=20):
@@ -335,7 +414,7 @@ def compute_risk_assessment(scored_df, full_df):
 
 # ========== 报告聚合 ==========
 
-def generate_report_data(preferences, scored_df, full_df):
+def generate_report_data(preferences, scored_df, full_df, weight_info=None):
     """
     聚合所有报告数据
     返回结构化dict供展示和PDF导出
@@ -359,8 +438,8 @@ def generate_report_data(preferences, scored_df, full_df):
     # 得分分解（Top5平均）
     top5 = scored_df.head(5)
     score_breakdown = {}
-    score_cols = ['S_price', 'S_area', 'S_age', 'S_unit', 'S_location']
-    score_labels = ['价格合理性', '面积匹配度', '房龄评分', '单价合理性', '地段热度']
+    score_cols = ['S_price', 'S_area', 'S_age', 'S_unit', 'S_location', 'S_afford']
+    score_labels = ['价格合理性', '面积匹配度', '房龄评分', '单价合理性', '地段热度', '购买力适配度']
     for col, label in zip(score_cols, score_labels):
         if col in top5.columns:
             score_breakdown[label] = round(top5[col].mean(), 1)
@@ -371,6 +450,36 @@ def generate_report_data(preferences, scored_df, full_df):
     avg_area = scored_df['area_num'].mean()
     avg_unit = scored_df['unit_num'].mean()
 
+    # 从 dataframe.attrs 获取权重信息
+    if weight_info is None:
+        weight_info = scored_df.attrs.get('weight_info', {})
+
+    # Top3 评分归因（每个房源的优劣势分析）
+    dim_labels = {
+        'S_price': '价格优', 'S_area': '面积匹配', 'S_age': '房龄新',
+        'S_unit': '单价低', 'S_location': '地段热', 'S_afford': '月供轻'
+    }
+    top3_analysis = []
+    for i in range(min(3, len(scored_df))):
+        src = scored_df.iloc[i]
+        dim_scores = {}
+        for col, label in dim_labels.items():
+            if col in src.index:
+                dim_scores[label] = float(src[col])
+        if dim_scores:
+            sorted_dims = sorted(dim_scores.items(), key=lambda x: x[1], reverse=True)
+            strengths = [(k, v) for k, v in sorted_dims[:3] if v >= 60][:2]
+            weakest = sorted_dims[-1]
+            top3_analysis.append({
+                'name': src.get('name', '--'),
+                'city': src.get('city', '--'),
+                'price': round(float(src.get('price_num', 0)), 1),
+                'score': round(float(src.get('score', 0)), 1),
+                'strengths': [f'{k}({v:.0f})' for k, v in strengths],
+                'weakness': f'{weakest[0]}({weakest[1]:.0f})' if weakest[1] < 70 else None,
+            })
+
+    # 从 dataframe.attrs 获取权重信息
     report = {
         'preferences': preferences,
         'match_count': len(scored_df),
@@ -379,10 +488,12 @@ def generate_report_data(preferences, scored_df, full_df):
         'avg_area': round(avg_area, 1),
         'avg_unit': round(avg_unit, 0),
         'top_listings': top_listings,
+        'top3_analysis': top3_analysis,
         'score_breakdown': score_breakdown,
         'investment': investment,
         'risk_overview': risk_overview,
         'risk_detail': risk_detail,
+        'weight_info': weight_info,
     }
 
     return report
@@ -472,6 +583,21 @@ def export_to_pdf(report_data):
     for k, v in breakdown.items():
         pdf.cell(0, 7, f"  {k}：{v}分", new_x='LMARGIN', new_y='NEXT')
     pdf.ln(3)
+
+    # 3.5 Top3 评分归因
+    top3_analysis = report_data.get('top3_analysis', [])
+    if top3_analysis:
+        pdf.set_font('CJK', 'B', 14)
+        pdf.cell(0, 10, '三.2、Top3 推荐理由', new_x='LMARGIN', new_y='NEXT')
+        pdf.set_font('CJK', '', 10)
+        for item in top3_analysis:
+            name = item.get('name', '--')
+            strengths = '  '.join(item.get('strengths', []))
+            weakness = item.get('weakness')
+            pdf.cell(0, 7, f"  {name}：{strengths}", new_x='LMARGIN', new_y='NEXT')
+            if weakness:
+                pdf.cell(0, 7, f"         短板：{weakness}", new_x='LMARGIN', new_y='NEXT')
+        pdf.ln(3)
 
     # 4. 投资评估
     pdf.set_font('CJK', 'B', 14)

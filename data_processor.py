@@ -267,3 +267,127 @@ def get_room_price_stats(df):
         平均面积=('area_num', 'mean')
     ).reset_index()
     return room_stats
+
+
+# ======================== 数据质量评估 ========================
+
+def get_city_year_coverage(df):
+    """
+    计算当前数据集（筛选后）的建成年份覆盖率。
+
+    用于评分引擎判断房龄维度的可靠性。
+
+    Returns:
+        float: 0.0 ~ 1.0，年份覆盖率
+        int: 总记录数
+        int: 有年份的记录数
+    """
+    if 'year_num' not in df.columns:
+        return 0.0, len(df), 0
+
+    total = len(df)
+    has_year = df['year_num'].notna().sum()
+    coverage = has_year / total if total > 0 else 0.0
+    return coverage, total, has_year
+
+
+def get_city_data_quality(df):
+    """
+    按城市维度统计数据质量指标。
+
+    Returns:
+        DataFrame with columns: city, 总挂牌量, 有年份数, 年份覆盖率, 质量等级
+    """
+    city_stats = df.groupby('city').agg(
+        总挂牌量=('price_num', 'count'),
+        有年份数=('year_num', lambda x: x.notna().sum()),
+    ).reset_index()
+
+    city_stats['年份覆盖率'] = (city_stats['有年份数'] / city_stats['总挂牌量'] * 100).round(1)
+
+    # 质量等级
+    def quality_label(pct):
+        if pct >= 90:
+            return 'A'
+        elif pct >= 70:
+            return 'B'
+        elif pct >= 50:
+            return 'C'
+        else:
+            return 'D'
+
+    city_stats['质量等级'] = city_stats['年份覆盖率'].apply(quality_label)
+    return city_stats.sort_values('总挂牌量', ascending=False)
+
+
+def get_coverage_summary(df):
+    """
+    获取数据集整体的年份覆盖率摘要。
+
+    Returns:
+        dict: {覆盖率, 等级, 等级描述, 算法行为}
+    """
+    coverage, total, has_year = get_city_year_coverage(df)
+
+    if coverage >= 0.9:
+        level, desc, action = 'A', '优秀', '房龄权重正常使用'
+    elif coverage >= 0.7:
+        level, desc, action = 'B', '良好', '房龄权重正常使用'
+    elif coverage >= 0.5:
+        level, desc, action = 'C', '一般', '房龄权重自动降低50%，差额分配至价格和面积'
+    else:
+        level, desc, action = 'D', '不足', '房龄权重自动降为0，全部转移至其他维度'
+
+    return {
+        '覆盖率': round(coverage * 100, 1),
+        '等级': level,
+        '等级描述': desc,
+        '算法行为': action,
+        '总记录数': total,
+        '有年份数': has_year,
+        '缺年份数': total - has_year,
+    }
+
+
+def adapt_age_weight(weights, coverage):
+    """
+    根据年份覆盖率自动调整房龄权重。
+
+    规则:
+      coverage >= 90% → 不变
+      coverage 70-90% → 不变
+      coverage 50-70% → 房龄权重减半，差额均分给其余4个维度
+      coverage < 50% → 房龄权重降为0，全部转移给其余维度
+
+    Args:
+        weights: dict, 原始权重 {'w_price': 70, 'w_area': 40, 'w_age': 50, ...}
+        coverage: float, 0.0~1.0
+
+    Returns:
+        dict: 调整后的权重（未归一化）
+    """
+    adjusted = dict(weights)
+
+    if coverage >= 0.7:
+        return adjusted  # A/B 级：不变
+
+    if 'w_age' not in adjusted:
+        return adjusted
+
+    original_age = adjusted['w_age']
+    other_keys = [k for k in adjusted if k != 'w_age']
+
+    if coverage >= 0.5:
+        # C 级：房龄权重减半
+        reduced_age = original_age * 0.5
+        redistributed = (original_age - reduced_age) / len(other_keys)
+        adjusted['w_age'] = reduced_age
+    else:
+        # D 级：完全移除房龄维度
+        redistributed = original_age / len(other_keys)
+        adjusted['w_age'] = 0
+
+    for k in other_keys:
+        adjusted[k] = adjusted.get(k, 20) + redistributed
+
+    return adjusted

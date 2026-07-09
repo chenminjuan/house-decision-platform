@@ -336,7 +336,7 @@ def plot_score_breakdown(scores_dict):
     values = list(scores_dict.values())
     # 创建图表
     plt.figure(figsize=(10, 5))
-    colors = ['steelblue', 'coral', 'seagreen', 'gold', 'mediumpurple']
+    colors = ['steelblue', 'coral', 'seagreen', 'gold', 'mediumpurple', 'teal']
     plt.barh(labels, values, color=colors[:len(labels)])
     # 数值标签
     for bar, val in zip(plt.gca().patches, values):

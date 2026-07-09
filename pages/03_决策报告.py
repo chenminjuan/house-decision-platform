@@ -6,8 +6,37 @@ import pandas as pd
 import numpy as np
 import base64
 import os
+import json
+from pathlib import Path
+from datetime import datetime
 
 st.set_page_config(page_title='决策报告', page_icon='📝', layout='wide')
+
+# ========== 城市查询日志（驱动回填优先级） ==========
+_QUERY_LOG_PATH = Path(__file__).parent.parent / 'data' / 'queried_cities.json'
+
+
+def _log_queried_cities(filtered_df):
+    """记录用户查询的城市及频次，供 backfill_years.py --auto 使用"""
+    cities = filtered_df['city'].unique().tolist()
+    log = {}
+    if _QUERY_LOG_PATH.exists():
+        try:
+            with open(_QUERY_LOG_PATH, 'r', encoding='utf-8') as f:
+                log = json.load(f)
+        except Exception:
+            pass
+
+    for city in cities:
+        if city in log:
+            log[city]['count'] = log[city].get('count', 0) + 1
+            log[city]['last_query'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            log[city] = {'count': 1, 'last_query': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+    with open(_QUERY_LOG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(log, f, ensure_ascii=False, indent=2)
+
 
 # 全局背景
 BG_IMAGE_PATH = os.path.join(os.path.dirname(__file__), '..', 'bg.jpg')
@@ -56,7 +85,41 @@ if 'report_generated' not in st.session_state:
 st.markdown('---')
 st.markdown('### Step 1: 填写购房偏好')
 
+# === 区域偏好（表单外：选省份实时联动城市列表） ===
+st.markdown('#### 区域偏好')
+
+from data_processor import get_province_list, get_city_list
+
+col_loc1, col_loc2 = st.columns(2)
+with col_loc1:
+    pref_province = st.selectbox('省份（可选）', options=get_province_list(df), key='report_province')
+with col_loc2:
+    city_options = get_city_list(df, pref_province)
+    preferred_locations = st.multiselect('期望城市（可多选，留空=全国）',
+                                         options=city_options[1:],
+                                         help='选择具体城市或留空搜索全国')
+
 with st.form('preferences_form'):
+    st.markdown('#### 你的购房能力')
+    col_income, col_expense, col_savings = st.columns(3)
+    with col_income:
+        monthly_income = st.number_input('家庭月收入（元）', min_value=1000, value=10000, step=500,
+                                         help='夫妻双方的税后月收入总和')
+    with col_expense:
+        monthly_expense = st.number_input('家庭月支出（元）', min_value=0, value=0, step=500,
+                                          help='每月固定开支（房租/生活费/车贷等），填0=使用收入估算')
+    with col_savings:
+        savings = st.number_input('可用于购房的储蓄（万元）', min_value=1, value=20, step=1,
+                                  help='包括存款、理财、父母资助等可用于首付的现金')
+    col_loan_years, col_first = st.columns(2)
+    with col_loan_years:
+        loan_years = st.selectbox('期望贷款年限', options=[10, 15, 20, 25, 30], index=4,
+                                  help='年限越长月供越低，但总利息越多')
+    with col_first:
+        is_first_house = st.selectbox('购房类型', options=['首套房', '二套房'], index=0,
+                                       help='首套首付20%，二套首付30%；契税税率也不同')
+        first_house = (is_first_house == '首套房')
+
     st.markdown('#### 预算与面积')
 
     col1, col2, col3 = st.columns(3)
@@ -93,22 +156,9 @@ with st.form('preferences_form'):
     with col_y2:
         year_max = st.number_input('最晚建成年份', min_value=1949, max_value=2025, value=2025, step=1)
 
-    st.markdown('#### 区域偏好')
-
-    from data_processor import get_province_list, get_city_list
-
-    col_loc1, col_loc2 = st.columns(2)
-    with col_loc1:
-        pref_province = st.selectbox('省份（可选）', options=get_province_list(df), key='report_province')
-    with col_loc2:
-        city_options = get_city_list(df, pref_province)
-        preferred_locations = st.multiselect('期望城市（可多选，留空=全国）',
-                                             options=city_options[1:],
-                                             help='选择具体城市或留空搜索全国')
-
     st.markdown('#### 各维度重要性权重（0-100，总和不要求=100，将自动归一化）')
 
-    col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(5)
+    col_w1, col_w2, col_w3, col_w4, col_w5, col_w6 = st.columns(6)
     with col_w1:
         w_price = st.slider('价格因素', 0, 100, 70, help='价格越低越好的重视程度')
     with col_w2:
@@ -119,6 +169,8 @@ with st.form('preferences_form'):
         w_unit = st.slider('单价合理性', 0, 100, 60, help='单价越低的重视程度')
     with col_w5:
         w_location = st.slider('地段热度', 0, 100, 30, help='市场活跃度的重视程度')
+    with col_w6:
+        w_afford = st.slider('买得起指数', 0, 100, 60, help='月供占收入比越低越好的重视程度')
 
     submitted = st.form_submit_button('🔍 生成决策报告', type='primary', use_container_width=True)
 
@@ -148,10 +200,16 @@ with st.form('preferences_form'):
                 'w_age': w_age,
                 'w_unit': w_unit,
                 'w_location': w_location,
+                'w_afford': w_afford,
             }
 
             st.session_state.report_preferences = preferences
             st.session_state.report_weights = weights
+            st.session_state.monthly_income = monthly_income
+            st.session_state.monthly_expense = monthly_expense
+            st.session_state.savings = savings
+            st.session_state.loan_years_input = loan_years
+            st.session_state.first_house = first_house
 
             with st.spinner('正在分析匹配房源，请稍候...'):
                 from decision_engine import hard_filter, compute_matching_score, generate_report_data
@@ -160,8 +218,29 @@ with st.form('preferences_form'):
                 st.info(f'硬筛选通过：{len(filtered):,} 套房源')
 
                 if len(filtered) > 0:
-                    scored = compute_matching_score(filtered, df, weights)
-                    report = generate_report_data(preferences, scored, df)
+                    # 保存筛选结果，供后续按需回填使用
+                    st.session_state.filtered_for_backfill = filtered
+
+                    scored, weight_info = compute_matching_score(
+                        filtered, df, weights,
+                        monthly_income=monthly_income,
+                        savings=savings,
+                        first_house=first_house,
+                        loan_years=loan_years,
+                        monthly_expense=monthly_expense if monthly_expense > 0 else None
+                    )
+
+                    # 购买力标记：为推荐列表增加月供和适配等级
+                    from affordability_engine import enrich_with_affordability
+                    scored = enrich_with_affordability(scored, monthly_income, savings,
+                                                       first_house=first_house, loan_years=loan_years,
+                                                       monthly_expense=monthly_expense if monthly_expense > 0 else None)
+                    st.session_state.scored_data = scored
+
+                    # 记录用户查询的城市（驱动回填优先级）
+                    _log_queried_cities(filtered)
+
+                    report = generate_report_data(preferences, scored, df, weight_info)
                     st.session_state.report_results = report
                     st.session_state.report_generated = True
                 else:
@@ -208,6 +287,165 @@ if st.session_state.report_generated and st.session_state.report_results:
                    delta=f'{report["avg_area"] - (prefs["area_min"] + prefs["area_max"]) / 2:+.1f}㎡',
                    delta_color='off')
 
+    # ===== 数据质量提示 + 按需回填 =====
+    weight_info = report.get('weight_info', {})
+    if weight_info and weight_info.get('adapted'):
+        cov = weight_info.get('coverage', 0)
+        level = weight_info.get('level', '?')
+        orig_w = weight_info.get('original_weights', {})
+        adj_w = weight_info.get('adjusted_weights', {})
+        orig_age = orig_w.get('w_age', 0)
+        adj_age = adj_w.get('w_age', 0)
+
+        level_color = {'A': 'green', 'B': 'green', 'C': 'orange', 'D': 'red'}.get(level, 'gray')
+
+        if level == 'D':
+            # D级：展示选项——跳过 or 补全
+            filtered_for_bf = st.session_state.get('filtered_for_backfill')
+            missing_count = filtered_for_bf['year_num'].isna().sum() if filtered_for_bf is not None else 0
+
+            st.markdown(f'''
+            <div style="background: #FFF3E0; border-radius: 10px; padding: 14px 18px;
+                        border-left: 4px solid #E65100; margin-bottom: 8px;">
+                <b>年份数据覆盖不足</b><br>
+                当前筛选结果年份覆盖率仅 <b style="color:#E65100">{cov}%</b>，
+                房龄评分权重已暂时关闭，当前推荐基于
+                价格、面积、月供、单价、地段 5个维度。
+            </div>
+            ''', unsafe_allow_html=True)
+
+            if missing_count > 0:
+                est_time = max(2, int(missing_count * 0.8))
+                st.caption(f'该城市有 {missing_count} 套房源缺少年份，补全预计需 {est_time} 秒。')
+
+                col_skip, col_fill = st.columns([1, 1])
+                with col_skip:
+                    st.markdown('*当前展示的是不含房龄评估的结果。*')
+                with col_fill:
+                    if st.button('🔍 补全年份数据，获得更精准推荐', type='primary', use_container_width=True,
+                                 key='backfill_btn', help=f'自动访问房源详情页补全约{missing_count}条年份数据'):
+                        with st.spinner(f'正在补全年份数据（约{est_time}秒）...'):
+                            from backfill_years import backfill_on_demand
+                            from decision_engine import hard_filter, compute_matching_score, generate_report_data
+                            from affordability_engine import enrich_with_affordability
+                            from data_processor import load_and_clean_data
+
+                            bf_result = backfill_on_demand(filtered_for_bf)
+
+                            if bf_result['filled'] > 0:
+                                # 重新加载数据
+                                st.session_state.cleaned_data = load_and_clean_data('data/house_sales.csv')
+                                new_df = st.session_state.cleaned_data
+
+                                # 重新筛选
+                                new_filtered = hard_filter(new_df, st.session_state.report_preferences)
+
+                                # 用完整权重重新评分（age不会被降级了）
+                                new_scored, new_wi = compute_matching_score(
+                                    new_filtered, new_df, st.session_state.report_weights,
+                                    monthly_income=st.session_state.get('monthly_income', 10000),
+                                    savings=st.session_state.get('savings', 20),
+                                    first_house=st.session_state.get('first_house', True),
+                                    loan_years=st.session_state.get('loan_years_input', 30),
+                                    monthly_expense=st.session_state.get('monthly_expense', 0) or None
+                                )
+                                new_scored = enrich_with_affordability(
+                                    new_scored,
+                                    st.session_state.get('monthly_income', 10000),
+                                    st.session_state.get('savings', 20),
+                                    first_house=st.session_state.get('first_house', True),
+                                    loan_years=st.session_state.get('loan_years_input', 30),
+                                    monthly_expense=st.session_state.get('monthly_expense', 0) or None
+                                )
+                                st.session_state.scored_data = new_scored
+                                _log_queried_cities(new_filtered)
+
+                                new_report = generate_report_data(
+                                    st.session_state.report_preferences, new_scored, new_df, new_wi
+                                )
+                                st.session_state.report_results = new_report
+
+                                # 存储回填后信息
+                                st.session_state.backfill_done = True
+                                st.session_state.backfill_result = bf_result
+
+                                st.success(f'已补全 {bf_result["filled"]} 条年份数据，'
+                                          f'覆盖率提升至 {bf_result["after_coverage"]}%')
+                                st.rerun()
+                            else:
+                                st.warning('未能补全任何数据，房源页面可能已失效。')
+                st.markdown('---')
+        else:
+            # C级：显示提示但不需要操作
+            st.markdown(f'''
+            <div style="background: #FFF8E1; border-radius: 10px; padding: 14px 18px;
+                        border-left: 4px solid {level_color}; margin-bottom: 12px;">
+                <b>数据质量提示</b><br>
+                当前筛选条件年份覆盖率: <b style="color:{level_color}">{cov}% ({level}级)</b><br>
+                房龄评分权重已自动从 <b>{orig_age}</b> 降低至 <b>{adj_age}</b>，
+                差额已分配至其他维度，以保证推荐结果可靠性。
+            </div>
+            ''', unsafe_allow_html=True)
+
+    # ===== 回填后仍低覆盖说明 =====
+    bf_done = st.session_state.get('backfill_done', False)
+    bf_result = st.session_state.get('backfill_result', {})
+    if bf_done and bf_result.get('after_coverage', 100) < 50:
+        still = bf_result.get('still_missing', 0)
+        total = bf_result.get('total_missing', 0) + bf_result.get('filled', 0)
+        st.markdown(f'''
+        <div style="background: #F5F5F5; border-radius: 10px; padding: 12px 16px;
+                    border-left: 4px solid #999; margin-bottom: 12px; font-size: 14px; color: #666;">
+            <b>说明</b><br>
+            补全后仍有 {still} 套（{bf_result["after_coverage"]}%）房源本身未标明年份。
+            当前剔除房龄权重的评估结果合理可靠——这些房源在市场上本就缺乏年份信息，
+            任何基于房龄的排序都不可信。
+        </div>
+        ''', unsafe_allow_html=True)
+
+    # ===== 购买力评估 =====
+    st.markdown('---')
+    st.markdown('#### 购买力评估')
+
+    from affordability_engine import calculate_affordable_range
+    mi = st.session_state.get('monthly_income', 10000)
+    me = st.session_state.get('monthly_expense', 0)
+    sv = st.session_state.get('savings', 20)
+    ly = st.session_state.get('loan_years_input', 30)
+    fh = st.session_state.get('first_house', True)
+
+    afford = calculate_affordable_range(mi, sv, area_min=prefs.get('area_min', 70),
+                                         area_max=prefs.get('area_max', 130),
+                                         loan_years=ly, first_house=fh,
+                                         monthly_expense=me if me > 0 else None)
+
+    aff_cols = st.columns(4)
+    aff_cols[0].metric('买得起总价（舒适线）', f'{afford["买得起总价_舒适线_万元"]}万',
+                       delta=f'月供≤{afford["月供舒适线_元"]}元/月',
+                       help=afford.get('舒适线说明', '月供不超过收入30%，还款无压力'))
+    aff_cols[1].metric('买得起总价（安全线）', f'{afford["买得起总价_安全线_万元"]}万',
+                       delta=f'月供≤{afford["月供安全线_元"]}元/月',
+                       help=afford.get('安全线说明', '月供不超过收入50%，银行审批上限'))
+    aff_cols[2].metric('首付需准备现金', f'{afford["首付所需现金_万元"]}万',
+                       delta=f'{afford["首付比例"]} | 储蓄{sv}万',
+                       help='首付+税费+中介费，不含装修')
+    aff_cols[3].metric('装修预算（额外）', f'{afford["装修预留_万元(额外)"]}万',
+                       delta='可后期分批投入',
+                       help=f'按{prefs.get("area_min", 70)}-{prefs.get("area_max", 130)}㎡ × 800元/㎡估算')
+
+    # 计算依据提示
+    if afford.get('家庭月支出_元') and afford['家庭月支出_元'] > 0:
+        st.caption(f"💡 {afford.get('计算说明', '')} —— 填写月支出后评估更精准")
+    else:
+        st.caption(f"💡 {afford.get('计算说明', '')} —— 建议填写月支出以获得更精准的评估")
+
+    # 适配等级分布
+    scored_for_display = st.session_state.get('scored_data')
+    if scored_for_display is not None and len(scored_for_display) > 0:
+        level_counts = scored_for_display['适配等级'].value_counts()
+        level_summary = ' | '.join([f'{k}: {v}套' for k, v in level_counts.items()])
+        st.caption(f'Top20推荐适配分布: {level_summary}')
+
     # ===== 得分分解 =====
     st.markdown('---')
     st.markdown('#### 各维度得分分解（Top5平均）')
@@ -223,20 +461,90 @@ if st.session_state.report_generated and st.session_state.report_results:
     st.markdown('---')
     st.markdown('#### Top 20 推荐房源')
     top_listings = report.get('top_listings', pd.DataFrame())
-    if len(top_listings) > 0:
-        display_df = top_listings.copy()
+
+    if scored_for_display is not None and len(scored_for_display) > 0:
+        # 用增强后的数据展示（含月供和适配等级）
+        top20 = scored_for_display.head(20)
+        show_cols_map = {
+            'city': '城市', 'name': '小区名称', 'price_num': '总价(万)',
+            'area_num': '面积(㎡)', 'rooms': '户型', 'toward': '朝向',
+            'score': '综合得分', '月供_元': '月供(元)', '月供占比': '月供占比(%)',
+            '落地成本_万元': '落地成本(万)', '适配等级': '适配等级'
+        }
+        display_cols = {k: v for k, v in show_cols_map.items() if k in top20.columns}
+        display_df = top20[list(display_cols.keys())].copy()
+        display_df.rename(columns=display_cols, inplace=True)
+        display_df['综合得分'] = display_df['综合得分'].round(1)
+
+        styled = display_df.style \
+            .background_gradient(subset=['综合得分'], cmap='RdYlGn') \
+            .map(lambda x: 'color: green; font-weight: bold' if '轻松' in str(x) else
+                           ('color: orange; font-weight: bold' if any(w in str(x) for w in ['适中', '紧张', '勉强']) else
+                            ('color: red; font-weight: bold' if '超预算' in str(x) else '')),
+                 subset=['适配等级'] if '适配等级' in display_df.columns else [])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    elif len(top_listings) > 0:
         st.dataframe(
-            display_df.style.background_gradient(subset=['综合得分'], cmap='RdYlGn'),
+            top_listings.style.background_gradient(subset=['综合得分'], cmap='RdYlGn'),
             use_container_width=True,
             hide_index=True
         )
 
+    if len(top_listings) > 0:
         st.markdown('**得分Top3房源卡片：**')
         top3_cols = st.columns(3)
         medals = ['🥇', '🥈', '🥉']
+
+        # 从 scored 数据取各维度得分，用于优劣势分析
+        scored_src = scored_for_display if scored_for_display is not None else top_listings
+        dim_labels = {
+            'S_price': '价格优', 'S_area': '面积匹配', 'S_age': '房龄新',
+            'S_unit': '单价低', 'S_location': '地段热', 'S_afford': '月供轻'
+        }
+
         for i in range(min(3, len(display_df))):
             row = display_df.iloc[i]
+
+            # -- 计算该房源的优劣势 --
+            src_row = None
+            if scored_src is not None and i < len(scored_src):
+                src_row = scored_src.iloc[i]
+            # 如果 scored_src 是按 score 排好序的（head 20），取对应位置
+            elif scored_src is not None and 'score' in scored_src.columns:
+                top_scored = scored_src.head(20)
+                if i < len(top_scored):
+                    src_row = top_scored.iloc[i]
+
+            strength_text = ''
+            weakness_text = ''
+            if src_row is not None:
+                dim_scores = {}
+                for col, label in dim_labels.items():
+                    if col in src_row.index:
+                        dim_scores[label] = float(src_row[col])
+                if dim_scores:
+                    sorted_dims = sorted(dim_scores.items(), key=lambda x: x[1], reverse=True)
+                    # 优势: 取最高2个（分数>60才算真正优势）
+                    strengths = [(k, v) for k, v in sorted_dims[:3] if v >= 60][:2]
+                    if strengths:
+                        strength_text = '优势：' + '  '.join([f'{k}({v:.0f})' for k, v in strengths])
+                    # 短板: 取最低1个
+                    weakest = sorted_dims[-1]
+                    if weakest[1] < 70:
+                        weakness_text = '短板：' + f'{weakest[0]}({weakest[1]:.0f})'
+
             with top3_cols[i]:
+                analysis_html = ''
+                if strength_text or weakness_text:
+                    analysis_html = '<div style="margin-top:8px; font-family:KaiTi,STKaiti,楷体,serif; font-size:13px; color:#666; line-height:1.6;">'
+                    if strength_text:
+                        analysis_html += f'<span>{strength_text}</span>'
+                    if weakness_text:
+                        if strength_text:
+                            analysis_html += '<br>'
+                        analysis_html += f'<span>{weakness_text}</span>'
+                    analysis_html += '</div>'
+
                 st.markdown(f'''
                 <div style="background: #f8f9fa; border-radius: 10px; padding: 15px;
                             border-left: 4px solid {'#FFD700' if i==0 else '#C0C0C0' if i==1 else '#CD7F32'};">
@@ -245,6 +553,7 @@ if st.session_state.report_generated and st.session_state.report_results:
                     <p><b>总价：</b>{row.get("总价(万)", "--")}万 | <b>面积：</b>{row.get("面积(㎡)", "--")}㎡</p>
                     <p><b>户型：</b>{row.get("户型", "--")} | <b>朝向：</b>{row.get("朝向", "--")}</p>
                     <p><b>单价：</b>{row.get("单价(元/㎡)", "--")}元/㎡ | <b>年份：</b>{row.get("建成年份", "--")}</p>
+                    {analysis_html}
                 </div>
                 ''', unsafe_allow_html=True)
 
